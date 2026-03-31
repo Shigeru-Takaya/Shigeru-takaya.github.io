@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<!-- file name: flute_longtone_29_mobile.html -->
+<!-- ver2.9 : auto trigger start by input threshold (-60dB), A4=442Hz, Auto note detection, C4-C7 -->
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>flute_longtone_29_mobile</title>
+<style>
+  body{
+    margin:0;
+    background:#000;
+    color:#ddd;
+    font-family:Arial, Helvetica, sans-serif;
+  }
+  .wrap{
+    width:100%;
+    max-width:100vw;
+    margin:0;
+    padding:8px;
+    box-sizing:border-box;
+  }
+  .toolbar{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    flex-wrap:wrap;
+    margin-bottom:8px;
+    font-size:14px;
+  }
+  .toolbar input, .toolbar select{
+    background:#111;
+    color:#eee;
+    border:1px solid #555;
+    padding:4px 6px;
+    font-size:14px;
+  }
+  .toolbar input{
+    width:72px;
+  }
+  .toolbar button{
+    background:#111;
+    color:#eee;
+    border:1px solid #666;
+    padding:6px 10px;
+    cursor:pointer;
+    font-size:14px;
+  }
+  .toolbar button:hover{
+    background:#1b1b1b;
+  }
+  .status{
+    font-size:13px;
+    color:#bbb;
+  }
+  canvas{
+    display:block;
+    width:100%;
+    height:auto;
+    background:#000;
+    border:1px solid #777;
+    box-sizing:border-box;
+  }
+  .footer{
+    margin-top:8px;
+    font-size:13px;
+    line-height:1.6;
+    color:#ddd;
+    min-height:42px;
+  }
+  .small{
+    color:#aaa;
+    font-size:12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <label>基音:
+      <select id="noteSelect"></select>
+    </label>
+    <label>測定時間(s):
+      <input id="durationInput" type="number" min="1" max="300" step="1" value="30">
+    </label>
+    <button id="startBtn">Start</button>
+    <button id="resetBtn">Reset</button>
+    <button id="csvBtn">CSV保存</button>
+    <span class="status" id="statusText">待機中</span>
+  </div>
+
+  <canvas id="fftCanvas"></canvas>
+
+  <div class="footer" id="resultText">選択基音: -- / 実測基音: -- / peaks: --</div>
+  <div class="small">横軸 = 周波数 / f0（選択基音） / 1〜8倍音基準線 / 停止後はピンク平均のみ表示 / 縦軸MAX自動調整 / A4=442Hz / -60dBで自動開始</div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("fftCanvas");
+  const ctx = canvas.getContext("2d");
+
+  const noteSelect = document.getElementById("noteSelect");
+  const durationInput = document.getElementById("durationInput");
+  const startBtn = document.getElementById("startBtn");
+  const resetBtn = document.getElementById("resetBtn");
+  const csvBtn = document.getElementById("csvBtn");
+  const statusText = document.getElementById("statusText");
+  const resultText = document.getElementById("resultText");
+
+  const REF_A4 = 442.0;
+  const AUTO_MIDI_MIN = 60; // C4
+  const AUTO_MIDI_MAX = 96; // C7
+  const MIN_DB = -120;
+  let displayMaxDb = 0;
+  const MAX_RATIO = 8.0;
+
+  const TRIGGER_DB = -60;
+  const TRIGGER_FRAMES = 3;   // 連続3フレームで開始
+  const AUTO_DETECT_MS = 700;
+
+  const MARGIN_LEFT = 78;
+  const MARGIN_RIGHT = 18;
+  const MARGIN_TOP = 18;
+  const MARGIN_BOTTOM = 58;
+
+  let PLOT_X = MARGIN_LEFT;
+  let PLOT_Y = MARGIN_TOP;
+  let PLOT_W = 0;
+  let PLOT_H = 0;
+
+  const GRID_COLOR = "rgba(180,180,180,0.20)";
+  const AXIS_TEXT = "#d8d8d8";
+  const CUR_COLOR = "#00e5ff";
+  const AVG_COLOR = "#ff5ad9";
+  const PEAK_COLOR = "#ffe75f";
+  const HARMONIC_LINE = "rgba(255,255,120,0.28)";
+
+  const FFT_SIZE = 4096;
+
+  let audioCtx = null;
+  let analyser = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let rafId = null;
+
+  let sampleRate = 44100;
+
+  let armed = false;          // 許可後の待機状態
+  let running = false;        // 本測定中
+  let finished = false;       // 測定完了
+  let autoDetecting = false;  // Auto判別中
+
+  let startTimeMs = 0;
+  let durationSec = 30;
+
+  let selectedF0 = midiToFreq(60);
+  let selectedNoteName = "C4";
+  let autoDetected = false;
+  let autoDetectedFreq = null;
+  let autoDetectedNote = null;
+
+  let maxBin = 0;
+  let freqAxis = [];
+  let ratioAxis = [];
+
+  let currentDb = [];
+  let avgLinear = [];
+  let avgDb = [];
+  let frameCount = 0;
+  let frozenAvgDb = null;
+  let harmonicPeaks = [];
+  let measuredF0 = null;
+
+  let triggerCount = 0;
+  let lastCurrentPeakDb = -120;
+  let selectedModeIsAuto = true;
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssWidth = Math.min(window.innerWidth - 16, 980);
+    const cssHeight = Math.round(cssWidth * 0.52);
+
+    canvas.style.width = cssWidth + "px";
+    canvas.style.height = cssHeight + "px";
+
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+  }
+
+  function updatePlotArea() {
+    const cssWidth = canvas.clientWidth;
+    const cssHeight = canvas.clientHeight;
+
+    PLOT_X = MARGIN_LEFT;
+    PLOT_Y = MARGIN_TOP;
+    PLOT_W = cssWidth - MARGIN_LEFT - MARGIN_RIGHT;
+    PLOT_H = cssHeight - MARGIN_TOP - MARGIN_BOTTOM;
+  }
+
+  function clamp(v, lo, hi){
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function ratioToX(ratio){
+    const rr = clamp(ratio / MAX_RATIO, 0, 1);
+    return PLOT_X + rr * PLOT_W;
+  }
+
+  function dbToY(db){
+    const d = clamp(db, MIN_DB, displayMaxDb);
+    const r = (d - MIN_DB) / (displayMaxDb - MIN_DB);
+    return PLOT_Y + PLOT_H - r * PLOT_H;
+  }
+
+  function midiToFreq(midi){
+    return REF_A4 * Math.pow(2, (midi - 69) / 12);
+  }
+
+  function hzToMidi(freq){
+    return 69 + 12 * Math.log2(freq / REF_A4);
+  }
+
+  function midiToNoteName(midi){
+    const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const m = Math.round(midi);
+    return `${noteNames[((m % 12) + 12) % 12]}${Math.floor(m / 12) - 1}`;
+  }
+
+  function hzToNoteName(freq){
+    if (!freq || freq <= 0) return "--";
+    return midiToNoteName(hzToMidi(freq));
+  }
+
+  function centsDiff(freq, ref){
+    return 1200 * Math.log2(freq / ref);
+  }
+
+  function populateNoteSelect(){
+    const autoOpt = document.createElement("option");
+    autoOpt.value = "AUTO";
+    autoOpt.textContent = "Auto";
+    autoOpt.dataset.note = "Auto";
+    autoOpt.selected = true;
+    noteSelect.appendChild(autoOpt);
+
+    for (let midi = AUTO_MIDI_MIN; midi <= AUTO_MIDI_MAX; midi++) {
+      const name = midiToNoteName(midi);
+      const freq = midiToFreq(midi);
+      const opt = document.createElement("option");
+      opt.value = String(freq);
+      opt.textContent = `${name} (${freq.toFixed(2)}Hz)`;
+      opt.dataset.note = name;
+      noteSelect.appendChild(opt);
+    }
+  }
+
+  function setStatus(text){
+    statusText.textContent = text;
+  }
+
+  function resetArrays(){
+    currentDb = new Array(maxBin + 1).fill(MIN_DB);
+    avgLinear = new Array(maxBin + 1).fill(0);
+    avgDb = new Array(maxBin + 1).fill(MIN_DB);
+    frozenAvgDb = null;
+    harmonicPeaks = [];
+    measuredF0 = null;
+    frameCount = 0;
+    triggerCount = 0;
+    lastCurrentPeakDb = -120;
+  }
+
+  function stopAnimation(){
+    if (rafId !== null){
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
+  function stopAudioStream(){
+    if (sourceNode){
+      try { sourceNode.disconnect(); } catch(e) {}
+      sourceNode = null;
+    }
+    if (mediaStream){
+      for (const tr of mediaStream.getTracks()) tr.stop();
+      mediaStream = null;
+    }
+    if (audioCtx){
+      try { audioCtx.close(); } catch(e) {}
+      audioCtx = null;
+      analyser = null;
+    }
+  }
+
+  function hardReset(){
+    armed = false;
+    running = false;
+    finished = false;
+    autoDetecting = false;
+    stopAnimation();
+    stopAudioStream();
+
+    currentDb = [];
+    avgLinear = [];
+    avgDb = [];
+    frozenAvgDb = null;
+    harmonicPeaks = [];
+    measuredF0 = null;
+    frameCount = 0;
+    displayMaxDb = 0;
+    triggerCount = 0;
+    lastCurrentPeakDb = -120;
+
+    autoDetected = false;
+    autoDetectedFreq = null;
+    autoDetectedNote = null;
+
+    setStatus("待機中");
+    resultText.textContent = "選択基音: -- / 実測基音: -- / peaks: --";
+    drawFrame();
+  }
+
+  function buildAxes(){
+    const maxFreqNeeded = selectedF0 * MAX_RATIO * 1.05;
+    const binHz = sampleRate / FFT_SIZE;
+
+    freqAxis = [];
+    ratioAxis = [];
+    maxBin = 0;
+
+    for (let i = 0; i <= FFT_SIZE / 2; i++){
+      const f = i * binHz;
+      if (f > maxFreqNeeded) break;
+      freqAxis.push(f);
+      ratioAxis.push(f / selectedF0);
+      maxBin = i;
+    }
+  }
+
+  async function initAudio(){
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    sampleRate = audioCtx.sampleRate;
+
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = FFT_SIZE;
+    analyser.smoothingTimeConstant = 0.0;
+    analyser.minDecibels = -120;
+    analyser.maxDecibels = 0;
+
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    sourceNode.connect(analyser);
+  }
+
+  function rebuildForSelectedF0(){
+    buildAxes();
+    resetArrays();
+  }
+
+  function getCurrentPeakDb(dbBuf){
+    let maxVal = -120;
+    for (let i = 1; i < dbBuf.length; i++){
+      const v = Number.isFinite(dbBuf[i]) ? dbBuf[i] : -120;
+      if (v > maxVal) maxVal = v;
+    }
+    return maxVal;
+  }
+
+  async function autoDetectNoteFromMic(){
+    autoDetecting = true;
+    setStatus("自動判別中...");
+
+    const dbBuf = new Float32Array(analyser.frequencyBinCount);
+    const avgLin = new Float32Array(analyser.frequencyBinCount);
+
+    let captures = 0;
+    const start = performance.now();
+
+    while (performance.now() - start < AUTO_DETECT_MS){
+      analyser.getFloatFrequencyData(dbBuf);
+      for (let i = 0; i < dbBuf.length; i++){
+        let db = dbBuf[i];
+        if (!Number.isFinite(db)) db = -120;
+        const lin = Math.pow(10, db / 20);
+        avgLin[i] += lin;
+      }
+      captures++;
+      await new Promise(r => setTimeout(r, 35));
+    }
+
+    if (captures === 0){
+      autoDetecting = false;
+      throw new Error("自動判別用データ取得失敗");
+    }
+
+    const avgDbDetect = new Float32Array(analyser.frequencyBinCount);
+    for (let i = 0; i < avgLin.length; i++){
+      const lin = avgLin[i] / captures;
+      avgDbDetect[i] = 20 * Math.log10(Math.max(lin, 1e-12));
+    }
+
+    const binHz = sampleRate / FFT_SIZE;
+    const fMin = midiToFreq(AUTO_MIDI_MIN) * 0.95;
+    const fMax = midiToFreq(AUTO_MIDI_MAX) * 1.05;
+
+    let bestIdx = -1;
+    let bestDb = -999;
+
+    for (let i = 2; i < avgDbDetect.length - 2; i++){
+      const f = i * binHz;
+      if (f < fMin || f > fMax) continue;
+
+      const y = avgDbDetect[i];
+      if (y < -95) continue;
+
+      if (
+        y > avgDbDetect[i - 1] &&
+        y > avgDbDetect[i + 1] &&
+        y > avgDbDetect[i - 2] &&
+        y > avgDbDetect[i + 2] &&
+        y > bestDb
+      ){
+        bestDb = y;
+        bestIdx = i;
+      }
+    }
+
+    if (bestIdx < 0){
+      autoDetecting = false;
+      throw new Error("基音自動判別に失敗");
+    }
+
+    const detectedFreq = bestIdx * binHz;
+    let detectedMidi = Math.round(hzToMidi(detectedFreq));
+    detectedMidi = clamp(detectedMidi, AUTO_MIDI_MIN, AUTO_MIDI_MAX);
+
+    autoDetected = true;
+    autoDetectedFreq = detectedFreq;
+    autoDetectedNote = midiToNoteName(detectedMidi);
+
+    selectedF0 = midiToFreq(detectedMidi);
+    selectedNoteName = midiToNoteName(detectedMidi);
+
+    for (let i = 0; i < noteSelect.options.length; i++){
+      const opt = noteSelect.options[i];
+      if (opt.dataset.note === selectedNoteName){
+        noteSelect.selectedIndex = i;
+        break;
+      }
+    }
+
+    rebuildForSelectedF0();
+    autoDetecting = false;
+    setStatus(`自動判別: ${selectedNoteName} ${selectedF0.toFixed(2)}Hz`);
+  }
+
+  function updateDisplayMaxDb() {
+    let source = null;
+
+    if ((running || armed) && avgDb && avgDb.length > 0) {
+      source = avgDb;
+    } else if (finished && frozenAvgDb && frozenAvgDb.length > 0) {
+      source = frozenAvgDb;
+    } else {
+      displayMaxDb = 0;
+      return;
+    }
+
+    let maxVal = -120;
+    for (let i = 0; i < source.length; i++) {
+      if (Number.isFinite(source[i]) && source[i] > maxVal) {
+        maxVal = source[i];
+      }
+    }
+
+    displayMaxDb = Math.ceil((maxVal + 5) / 5) * 5;
+
+    if (displayMaxDb > 0) displayMaxDb = 0;
+    if (displayMaxDb < -60) displayMaxDb = -60;
+  }
+
+  function drawBackground(){
+    ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+  }
+
+  function drawGridAndAxes(){
+    ctx.save();
+
+    ctx.strokeStyle = "rgba(220,220,220,0.35)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(PLOT_X, PLOT_Y, PLOT_W, PLOT_H);
+
+    for (let r = 0; r <= MAX_RATIO; r += 0.5){
+      const x = ratioToX(r);
+      ctx.beginPath();
+      ctx.strokeStyle = (Math.abs(r - Math.round(r)) < 1e-9) ? "rgba(200,200,200,0.22)" : GRID_COLOR;
+      ctx.moveTo(x, PLOT_Y);
+      ctx.lineTo(x, PLOT_Y + PLOT_H);
+      ctx.stroke();
+
+      ctx.fillStyle = AXIS_TEXT;
+      ctx.font = "12px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      if (Math.abs(r - Math.round(r)) < 1e-9){
+        ctx.fillText(`${r.toFixed(0)}`, x, PLOT_Y + PLOT_H + 8);
+      }
+    }
+
+    for (let n = 1; n <= 8; n++){
+      const x = ratioToX(n);
+      ctx.beginPath();
+      ctx.strokeStyle = HARMONIC_LINE;
+      ctx.lineWidth = 1.2;
+      ctx.moveTo(x, PLOT_Y);
+      ctx.lineTo(x, PLOT_Y + PLOT_H);
+      ctx.stroke();
+
+      ctx.fillStyle = "#d8d880";
+      ctx.font = "12px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`${n}f`, x, PLOT_Y - 2);
+    }
+
+    for (let db = MIN_DB; db <= displayMaxDb; db += 10){
+      const y = dbToY(db);
+      ctx.beginPath();
+      ctx.strokeStyle = GRID_COLOR;
+      ctx.moveTo(PLOT_X, y);
+      ctx.lineTo(PLOT_X + PLOT_W, y);
+      ctx.stroke();
+
+      ctx.fillStyle = AXIS_TEXT;
+      ctx.font = "12px Arial";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(`${db}dB`, PLOT_X - 8, y);
+    }
+
+    ctx.fillStyle = AXIS_TEXT;
+    ctx.font = "12px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText("周波数 / f0", PLOT_X + PLOT_W / 2, canvas.clientHeight - 20);
+
+    ctx.restore();
+  }
+
+  function drawCurve(dbArray, color, lineWidth = 1.6){
+    if (!dbArray || dbArray.length === 0) return;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PLOT_X, PLOT_Y, PLOT_W, PLOT_H);
+    ctx.clip();
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+
+    let first = true;
+    for (let i = 0; i < dbArray.length; i++){
+      const ratio = ratioAxis[i];
+      if (ratio > MAX_RATIO) break;
+      const x = ratioToX(ratio);
+      const y = dbToY(dbArray[i]);
+
+      if (first){
+        ctx.moveTo(x, y);
+        first = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHarmonicMarkers(peaks){
+    if (!peaks || peaks.length === 0) return;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PLOT_X, PLOT_Y, PLOT_W, PLOT_H);
+    ctx.clip();
+
+    ctx.strokeStyle = PEAK_COLOR;
+    ctx.fillStyle = PEAK_COLOR;
+    ctx.font = "12px Arial";
+    ctx.lineWidth = 1;
+
+    const placed = [];
+
+    for (let i = 0; i < peaks.length; i++){
+      const p = peaks[i];
+      const xPeak = ratioToX(p.ratio);
+      const yPeak = dbToY(p.db);
+
+      const side = (i % 2 === 0) ? 1 : -1;
+      let xLabel = xPeak + side * 34;
+      let yLabel = yPeak - 18 - i * 8;
+
+      for (const q of placed){
+        if (Math.abs(xLabel - q.xLabel) < 88 && Math.abs(yLabel - q.yLabel) < 16){
+          yLabel -= 14;
+        }
+      }
+
+      xLabel = clamp(xLabel, PLOT_X + 45, PLOT_X + PLOT_W - 45);
+      yLabel = Math.max(PLOT_Y + 14, yLabel);
+
+      ctx.beginPath();
+      ctx.moveTo(xPeak, yPeak);
+      ctx.lineTo(xPeak, yLabel - 6);
+      ctx.lineTo(xLabel, yLabel - 6);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(xPeak, yPeak, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.textAlign = side > 0 ? "left" : "right";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`${p.order}f ${p.freq.toFixed(1)}Hz`, xLabel, yLabel);
+
+      placed.push({xLabel, yLabel});
+    }
+
+    ctx.restore();
+  }
+
+  function drawHeader(){
+    ctx.save();
+    ctx.fillStyle = "#cfcfcf";
+    ctx.font = "13px Arial";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+
+    let modeText = "READY";
+    if (autoDetecting) modeText = "AUTO DETECT";
+    else if (running) modeText = "RUN";
+    else if (armed) modeText = "ARMED";
+    else if (finished) modeText = "HOLD";
+
+    const elapsed = running ? ((performance.now() - startTimeMs) / 1000).toFixed(1) : "0.0";
+    const autoText = autoDetected ? ` Auto:${autoDetectedNote}` : "";
+    ctx.fillText(`Flute mode  ver2.9   Mode:${modeText}   Time:${elapsed}s   f0:${selectedNoteName} ${selectedF0.toFixed(2)}Hz${autoText}   Ymax:${displayMaxDb}dB   Trig:${TRIGGER_DB}dB`, 10, 6);
+
+    const lx = canvas.clientWidth - 230;
+    const ly = 8;
+
+    ctx.strokeStyle = CUR_COLOR;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(lx, ly + 8);
+    ctx.lineTo(lx + 28, ly + 8);
+    ctx.stroke();
+    ctx.fillStyle = "#d8d8d8";
+    ctx.fillText("Current", lx + 36, ly + 1);
+
+    ctx.strokeStyle = AVG_COLOR;
+    ctx.beginPath();
+    ctx.moveTo(lx + 100, ly + 8);
+    ctx.lineTo(lx + 128, ly + 8);
+    ctx.stroke();
+    ctx.fillText("Average", lx + 136, ly + 1);
+
+    ctx.restore();
+  }
+
+  function drawFrame(){
+    updatePlotArea();
+    updateDisplayMaxDb();
+    drawBackground();
+    drawGridAndAxes();
+    drawHeader();
+
+    if (armed || running){
+      drawCurve(avgDb, AVG_COLOR, 2.2);
+      drawCurve(currentDb, CUR_COLOR, 1.4);
+    } else if (finished && frozenAvgDb){
+      drawCurve(frozenAvgDb, AVG_COLOR, 2.2);
+      drawHarmonicMarkers(harmonicPeaks);
+    }
+  }
+
+  function updateSpectrum(){
+    if (!analyser) return;
+
+    const dbBuf = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(dbBuf);
+
+    lastCurrentPeakDb = getCurrentPeakDb(dbBuf);
+
+    for (let i = 0; i <= maxBin; i++){
+      let db = dbBuf[i];
+      if (!Number.isFinite(db)) db = -120;
+
+      currentDb[i] = db;
+
+      const lin = Math.pow(10, db / 20);
+      if (frameCount === 0){
+        avgLinear[i] = lin;
+      } else {
+        avgLinear[i] = (avgLinear[i] * frameCount + lin) / (frameCount + 1);
+      }
+
+      avgDb[i] = 20 * Math.log10(Math.max(avgLinear[i], 1e-12));
+    }
+
+    frameCount++;
+  }
+
+  function findMeasuredFundamental(dbArray){
+    const fMin = selectedF0 * 0.90;
+    const fMax = selectedF0 * 1.10;
+
+    let bestIdx = -1;
+    let bestDb = -999;
+
+    for (let i = 1; i < dbArray.length - 1; i++){
+      const f = freqAxis[i];
+      if (f < fMin || f > fMax) continue;
+
+      const y = dbArray[i];
+      if (y > dbArray[i-1] && y > dbArray[i+1] && y > bestDb){
+        bestDb = y;
+        bestIdx = i;
+      }
+    }
+
+    if (bestIdx < 0){
+      let nearestIdx = 0;
+      let bestDist = 1e9;
+      for (let i = 0; i < dbArray.length; i++){
+        const d = Math.abs(freqAxis[i] - selectedF0);
+        if (d < bestDist){
+          bestDist = d;
+          nearestIdx = i;
+        }
+      }
+      return {freq: freqAxis[nearestIdx], db: dbArray[nearestIdx], idx: nearestIdx};
+    }
+
+    return {freq: freqAxis[bestIdx], db: dbArray[bestIdx], idx: bestIdx};
+  }
+
+  function findHarmonicPeaks(dbArray, baseFreq){
+    const out = [];
+    for (let n = 1; n <= 8; n++){
+      const target = baseFreq * n;
+      const w = Math.max(18, target * 0.03);
+
+      let bestIdx = -1;
+      let bestDb = -999;
+
+      for (let i = 1; i < dbArray.length - 1; i++){
+        const f = freqAxis[i];
+        if (f < target - w || f > target + w) continue;
+
+        const y = dbArray[i];
+        if (y > dbArray[i-1] && y > dbArray[i+1] && y > bestDb){
+          bestDb = y;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx >= 0){
+        out.push({
+          order: n,
+          freq: freqAxis[bestIdx],
+          ratio: freqAxis[bestIdx] / selectedF0,
+          db: dbArray[bestIdx]
+        });
+      } else {
+        let nearestIdx = 0;
+        let bestDist = 1e9;
+        for (let i = 0; i < dbArray.length; i++){
+          const dist = Math.abs(freqAxis[i] - target);
+          if (dist < bestDist){
+            bestDist = dist;
+            nearestIdx = i;
+          }
+        }
+        out.push({
+          order: n,
+          freq: freqAxis[nearestIdx],
+          ratio: freqAxis[nearestIdx] / selectedF0,
+          db: dbArray[nearestIdx]
+        });
+      }
+    }
+    return out;
+  }
+
+  function updateResultText(){
+    if (!finished || !frozenAvgDb){
+      const autoText = autoDetected
+        ? ` / Auto判定: ${autoDetectedNote} 実測${autoDetectedFreq.toFixed(1)}Hz→理論${selectedF0.toFixed(2)}Hz`
+        : "";
+      resultText.textContent = `選択基音: ${selectedNoteName} ${selectedF0.toFixed(2)}Hz${autoText} / 実測基音: -- / peaks: --`;
+      return;
+    }
+
+    const cents = measuredF0 ? centsDiff(measuredF0.freq, selectedF0) : 0;
+    const measuredText = measuredF0
+      ? `${hzToNoteName(measuredF0.freq)} ${measuredF0.freq.toFixed(1)}Hz (${cents >= 0 ? "+" : ""}${cents.toFixed(1)} cent)`
+      : "--";
+
+    const peakText = harmonicPeaks.length
+      ? harmonicPeaks.map(p => `${p.order}f:${p.freq.toFixed(1)}Hz`).join(", ")
+      : "--";
+
+    const autoText = autoDetected
+      ? ` / Auto判定: ${autoDetectedNote} 実測${autoDetectedFreq.toFixed(1)}Hz→理論${selectedF0.toFixed(2)}Hz`
+      : "";
+
+    resultText.textContent = `選択基音: ${selectedNoteName} ${selectedF0.toFixed(2)}Hz${autoText} / 実測基音: ${measuredText} / peaks: ${peakText}`;
+  }
+
+  async function beginTriggeredMeasurement(){
+    if (selectedModeIsAuto){
+      await autoDetectNoteFromMic();
+    }
+    running = true;
+    armed = false;
+    finished = false;
+    startTimeMs = performance.now();
+    setStatus("測定開始");
+    updateResultText();
+  }
+
+  async function loop(){
+    if (!(armed || running || autoDetecting)) return;
+
+    if (!autoDetecting) {
+      updateSpectrum();
+      drawFrame();
+    }
+
+    if (armed && !autoDetecting){
+      setStatus(`待機中 入力:${lastCurrentPeakDb.toFixed(1)}dB / 開始閾値:${TRIGGER_DB}dB`);
+
+      if (lastCurrentPeakDb >= TRIGGER_DB){
+        triggerCount++;
+      } else {
+        triggerCount = 0;
+      }
+
+      if (triggerCount >= TRIGGER_FRAMES){
+        triggerCount = 0;
+        try {
+          await beginTriggeredMeasurement();
+        } catch (err){
+          console.error(err);
+          armed = false;
+          setStatus(`開始失敗: ${err.name || ""}`);
+          resultText.textContent = err && err.message ? err.message : "自動開始に失敗しました";
+          drawFrame();
+          return;
+        }
+      }
+    }
+
+    if (running){
+      const elapsedSec = (performance.now() - startTimeMs) / 1000;
+      setStatus(`測定中 ${elapsedSec.toFixed(1)} / ${durationSec.toFixed(1)} s`);
+
+      if (elapsedSec >= durationSec){
+        running = false;
+        finished = true;
+        frozenAvgDb = avgDb.slice();
+        measuredF0 = findMeasuredFundamental(frozenAvgDb);
+        harmonicPeaks = findHarmonicPeaks(frozenAvgDb, selectedF0);
+        updateResultText();
+        setStatus("測定終了");
+        drawFrame();
+        return;
+      }
+    }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function saveCSV(){
+    const target = finished && frozenAvgDb ? frozenAvgDb : avgDb;
+    if (!target || target.length === 0) return;
+
+    let csv = "freq_hz,ratio_to_f0,avg_db\n";
+    for (let i = 0; i < target.length; i++){
+      csv += `${freqAxis[i]},${ratioAxis[i]},${target[i]}\n`;
+    }
+
+    csv += "\nselected_note,selected_f0_hz,auto_detected,auto_detected_freq_hz\n";
+    csv += `${selectedNoteName},${selectedF0},${autoDetected},${autoDetectedFreq ?? ""}\n`;
+
+    if (measuredF0){
+      csv += "\nmeasured_f0_hz,measured_note,cents_from_selected\n";
+      csv += `${measuredF0.freq},${hzToNoteName(measuredF0.freq)},${centsDiff(measuredF0.freq, selectedF0)}\n`;
+    }
+
+    csv += "\nharmonic_order,peak_freq_hz,ratio_to_f0,peak_db\n";
+    for (const p of harmonicPeaks){
+      csv += `${p.order},${p.freq},${p.ratio},${p.db}\n`;
+    }
+
+    const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "flute_longtone_29_mobile.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  startBtn.addEventListener("click", async () => {
+    if (armed || running || autoDetecting) return;
+
+    try {
+      hardReset();
+
+      const selectedOption = noteSelect.options[noteSelect.selectedIndex];
+      const selectedValue = selectedOption.value;
+      durationSec = Math.max(1, Number(durationInput.value) || 30);
+      selectedModeIsAuto = (selectedValue === "AUTO");
+
+      await initAudio();
+
+      if (selectedModeIsAuto){
+        // Autoは仮のf0で待機。トリガー後に判別して再構築
+        selectedF0 = midiToFreq(69); // A4=442Hz を仮基準に
+        selectedNoteName = "Auto";
+      } else {
+        selectedF0 = Number(selectedValue);
+        selectedNoteName = selectedOption.dataset.note;
+      }
+
+      rebuildForSelectedF0();
+
+      armed = true;
+      finished = false;
+      setStatus(`待機中 入力閾値 ${TRIGGER_DB}dB で自動開始`);
+      updateResultText();
+      drawFrame();
+      loop();
+
+    } catch (err){
+      console.error(err);
+      setStatus(`開始失敗: ${err.name || ""}`);
+      resultText.textContent = err && err.message ? err.message : "マイク初期化に失敗しました";
+    }
+  });
+
+  resetBtn.addEventListener("click", () => {
+    hardReset();
+  });
+
+  csvBtn.addEventListener("click", () => {
+    saveCSV();
+  });
+
+  window.addEventListener("resize", () => {
+    resizeCanvas();
+    updatePlotArea();
+    drawFrame();
+  });
+
+  populateNoteSelect();
+  resizeCanvas();
+  updatePlotArea();
+  drawFrame();
+})();
+</script>
+</body>
+</html>
