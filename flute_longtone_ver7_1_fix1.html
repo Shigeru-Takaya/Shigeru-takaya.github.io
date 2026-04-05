@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>flute_longtone_ver7_1_fix1</title>
+<style>
+  body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#111;color:#eee;margin:16px}
+  h1{font-size:22px;margin:0 0 12px}
+  .panel{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:12px;margin-bottom:12px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  label{display:inline-flex;align-items:center;gap:6px;margin:4px 10px 4px 0}
+  input[type="number"]{width:90px}
+  button{background:#2b6cb0;color:#fff;border:none;border-radius:8px;padding:8px 14px;cursor:pointer}
+  button:disabled{background:#555;cursor:not-allowed}
+  canvas{display:block;background:#000;border:1px solid #444;border-radius:8px;max-width:100%;height:auto}
+  .small{font-size:13px;color:#bbb}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .ok{color:#90ee90}
+  .warn{color:#ffd27f}
+</style>
+</head>
+<body>
+<h1>flute_longtone_ver7_1_fix1</h1>
+
+<div class="panel">
+  <div class="row">
+    <button id="startBtn">マイク開始</button>
+    <button id="stopBtn" disabled>停止</button>
+    <label>FFTサイズ <input type="number" id="fftSize" value="4096" step="1024" min="1024"></label>
+    <label>最大倍音 <input type="number" id="maxHarm" value="8" step="1" min="4" max="20"></label>
+    <label>縦軸最小[dB] <input type="number" id="minDb" value="-120" step="5"></label>
+    <label>帯域幅[x] <input type="number" id="bandWidth" value="0.05" step="0.01" min="0.01" max="0.20"></label>
+    <label>安定区間遅延[s] <input type="number" id="stableDelay" value="0.7" step="0.1" min="0.0" max="3.0"></label>
+    <label>開始閾値[dBFS] <input type="number" id="startThreshold" value="-60" step="1" min="-90" max="-10"></label>
+  </div>
+  <div class="small" id="status">マイク開始を押してください。</div>
+  <div class="small mono" id="info">f0: - Hz / note: - / level(v3.5互換): - dB / rms: - dBFS</div>
+</div>
+
+<div class="panel">
+  <div><b>リアルタイム判定</b></div>
+  <div id="judgeBox" class="small mono" style="line-height:1.6; margin-top:8px; white-space:pre-wrap;">Pitch: - cent / Timbre: score - / Vibrato: - / Dyn/Range: - / Series balance: - dB / Noise gap: - dB
+Reason: -
+Advice: -</div>
+</div>
+
+<div class="panel">
+  <div><b>良い状態のゾーン可視化</b></div>
+  <canvas id="zoneCanvas" width="1100" height="210"></canvas>
+  <div class="small">Pitch: ±10 cent以内 / Timbre: 80以上 / Series balance: +5〜+15 dB / Noise gap: 30 dB以上 を目安に緑帯表示</div>
+</div>
+
+<div class="panel">
+  <div>リアルタイムスペアナ（横軸：周波数 / 基音）</div>
+  <canvas id="specCanvas" width="1100" height="500"></canvas>
+</div>
+
+<div class="panel">
+  <div>直前40フレームの基音推移</div>
+  <canvas id="trailCanvas" width="1100" height="180"></canvas>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const startBtn = $('startBtn');
+  const stopBtn = $('stopBtn');
+  const statusEl = $('status');
+  const infoEl = $('info');
+  const judgeBox = $('judgeBox');
+  const specCanvas = $('specCanvas');
+  const specCtx = specCanvas.getContext('2d');
+  const trailCanvas = $('trailCanvas');
+  const trailCtx = trailCanvas.getContext('2d');
+  const zoneCanvas = $('zoneCanvas');
+  const zoneCtx = zoneCanvas.getContext('2d');
+
+  let audioCtx = null, mediaStream = null, sourceNode = null, processor = null;
+  let running = false;
+  let ringBuffer = [];
+  let frames = [];
+  const maxFrames = 400;
+  let isTriggered = false;
+  let lastUpdateMs = 0;
+  const V35_LEVEL_OFFSET = 58.0; // ver3.5互換の見かけレベル補正
+
+  function setStatus(text, cls=''){
+    statusEl.className = 'small ' + cls;
+    statusEl.textContent = text;
+  }
+  function clearCanvas(ctx){
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,ctx.canvas.width,ctx.canvas.height);
+  }
+  function resetView(){
+    clearCanvas(specCtx); clearCanvas(trailCtx); clearCanvas(zoneCtx);
+    infoEl.textContent = 'f0: - Hz / note: - / level(v3.5互換): - dB / rms: - dBFS';
+    judgeBox.textContent = 'Pitch: - cent / Timbre: score - / Vibrato: - / Dyn/Range: - / Series balance: - dB / Noise gap: - dB\nReason: -\nAdvice: -';
+  }
+  resetView();
+
+  function hann(N){
+    const w = new Float32Array(N);
+    for(let i=0;i<N;i++) w[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/(N-1));
+    return w;
+  }
+  function nextPow2(n){ let p=1; while(p<n) p<<=1; return p; }
+  function dB(v){ return 20*Math.log10(v + 1e-12); }
+  function v35LikeLevelFromMags(mags){
+    let peak = 1e-12;
+    for(let i=1;i<mags.length;i++) if(mags[i] > peak) peak = mags[i];
+    return dB(peak) - V35_LEVEL_OFFSET;
+  }
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+  function average(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
+  function median(arr){
+    const a = arr.slice().sort((x,y)=>x-y); const n=a.length;
+    if(!n) return null;
+    return n % 2 ? a[(n-1)/2] : 0.5*(a[n/2-1] + a[n/2]);
+  }
+  function freqToNoteName442(freq){
+    if(!freq || !isFinite(freq) || freq <= 0) return '-';
+    const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const midi = Math.round(69 + 12 * Math.log2(freq / 442));
+    return names[((midi % 12)+12)%12] + (Math.floor(midi / 12) - 1);
+  }
+  function nearestNoteFreq442(freq){
+    if(!freq || !isFinite(freq) || freq <= 0) return null;
+    const midi = Math.round(69 + 12 * Math.log2(freq / 442));
+    return 442 * Math.pow(2, (midi - 69) / 12);
+  }
+  function centsDiff442(freq){
+    const ref = nearestNoteFreq442(freq);
+    if(!ref) return null;
+    return 1200 * Math.log2(freq / ref);
+  }
+  function judgePitchText(cents){
+    const a = Math.abs(cents);
+    if(a <= 8) return '非常に良好';
+    if(a <= 15) return '良好';
+    if(a <= 25) return 'やや不安定';
+    return '要調整';
+  }
+  function fftRealMag(signal){
+    const N = signal.length;
+    const re = new Float32Array(N), im = new Float32Array(N);
+    re.set(signal);
+    let j=0;
+    for(let i=0;i<N;i++){
+      if(i<j){ let tr=re[i]; re[i]=re[j]; re[j]=tr; let ti=im[i]; im[i]=im[j]; im[j]=ti; }
+      let m=N>>1; while(j>=m && m>=2){ j-=m; m>>=1; } j+=m;
+    }
+    for(let size=2; size<=N; size<<=1){
+      const half=size>>1, theta=-2*Math.PI/size, wpr=Math.cos(theta), wpi=Math.sin(theta);
+      for(let start=0; start<N; start+=size){
+        let wr=1, wi=0;
+        for(let k=0;k<half;k++){
+          const even=start+k, odd=even+half;
+          const tr=wr*re[odd]-wi*im[odd], ti=wr*im[odd]+wi*re[odd];
+          re[odd]=re[even]-tr; im[odd]=im[even]-ti; re[even]+=tr; im[even]+=ti;
+          const tmpWr = wr*wpr - wi*wpi; wi = wr*wpi + wi*wpr; wr = tmpWr;
+        }
+      }
+    }
+    const mags = new Float32Array(N/2+1);
+    for(let i=0;i<=N/2;i++) mags[i]=Math.hypot(re[i],im[i]);
+    return mags;
+  }
+  function estimateF0AC(frame, sr, fmin=200, fmax=1500){
+    const N = frame.length;
+    let mean=0; for(let i=0;i<N;i++) mean += frame[i]; mean /= N;
+    const x = new Float32Array(N);
+    let energy=0;
+    for(let i=0;i<N;i++){ const v=frame[i]-mean; x[i]=v; energy += v*v; }
+    if(energy < 1e-8) return null;
+    const minLag=Math.floor(sr/fmax), maxLag=Math.floor(sr/fmin);
+    let bestLag=-1, bestVal=-1;
+    for(let lag=minLag; lag<=maxLag; lag++){
+      let s=0;
+      for(let i=0;i<N-lag;i++) s += x[i] * x[i+lag];
+      if(s > bestVal){ bestVal=s; bestLag=lag; }
+    }
+    return bestLag > 0 ? sr / bestLag : null;
+  }
+  function localSmoothness(spec, centerIdx, span){
+    let sum=0, cnt=0;
+    for(let i=Math.max(1, centerIdx-span); i<=Math.min(spec.length-2, centerIdx+span); i++){
+      sum += Math.abs(spec[i-1] - 2*spec[i] + spec[i+1]); cnt++;
+    }
+    return cnt ? sum / cnt : 0;
+  }
+  function getBandEnergy(spec, center, width, maxHarm){
+    const len = spec.length;
+    const c = center / maxHarm * (len - 1);
+    const w = width / maxHarm * (len - 1);
+    let sum=0, count=0;
+    for(let i=Math.floor(c-w); i<=Math.floor(c+w); i++){
+      if(i>=0 && i<len){ sum += Math.pow(10, spec[i] / 20); count++; }
+    }
+    if(count===0) return -120;
+    return 20*Math.log10(sum / count + 1e-12);
+  }
+  function getInterHarmonicNoise(spec, centerA, centerB, edgePad, maxHarm){
+    const len = spec.length;
+    const left = (centerA + edgePad) / maxHarm * (len - 1);
+    const right = (centerB - edgePad) / maxHarm * (len - 1);
+    let sum=0, count=0;
+    for(let i=Math.ceil(left); i<=Math.floor(right); i++){
+      if(i>=0 && i<len){ sum += Math.pow(10, spec[i]/20); count++; }
+    }
+    if(count===0) return -120;
+    return 20*Math.log10(sum / count + 1e-12);
+  }
+  function calcFrameStability(frameIdx, maxHarm, bandWidth){
+    if(!frames.length) return {pitchVar:0,h15Var:0,h3Var:0,h5Var:0};
+    const start=Math.max(0, frameIdx-10), end=Math.min(frames.length-1, frameIdx+10);
+    const f0s=[], h15s=[], h3s=[], h5s=[];
+    for(let i=start;i<=end;i++){
+      const fr=frames[i];
+      f0s.push(fr.f0);
+      h15s.push(getBandEnergy(fr.spec,1.5,bandWidth,maxHarm));
+      h3s.push(getBandEnergy(fr.spec,3.0,bandWidth,maxHarm));
+      h5s.push(getBandEnergy(fr.spec,5.0,bandWidth,maxHarm));
+    }
+    function mad(values){
+      const med = median(values); const absDev = values.map(v => Math.abs(v-med));
+      return median(absDev) || 0;
+    }
+    return {pitchVar:mad(f0s), h15Var:mad(h15s), h3Var:mad(h3s), h5Var:mad(h5s)};
+  }
+  function calcVibrato(frameIdx){
+    if(!frames.length) return {label:'-', rateHz:0, widthCent:0, isDetected:false};
+    const start=Math.max(0, frameIdx-25), end=Math.min(frames.length-1, frameIdx+25);
+    const subset=frames.slice(start,end+1);
+    if(subset.length < 12) return {label:'判定保留', rateHz:0, widthCent:0, isDetected:false};
+    const f0s=subset.map(f=>f.f0), med=median(f0s)||1;
+    const cents=f0s.map(f=>1200*Math.log2(f/med));
+    const mean=average(cents), centered=cents.map(v=>v-mean);
+    let crossings=0;
+    for(let i=1;i<centered.length;i++){
+      if((centered[i-1] <= 0 && centered[i] > 0) || (centered[i-1] >= 0 && centered[i] < 0)) crossings++;
+    }
+    const dur=Math.max(1e-6, subset[subset.length-1].t - subset[0].t);
+    const rateHz = crossings >= 2 ? (crossings/2)/dur : 0;
+    const widthCent = (Math.max(...centered) - Math.min(...centered)) / 2;
+    let label='なし', isDetected=false;
+    if(rateHz >= 3.5 && rateHz <= 8.5 && widthCent >= 8 && widthCent <= 60){ label='あり'; isDetected=true; }
+    else if(widthCent >= 5 || rateHz >= 2.0){ label='弱い/不規則'; }
+    return {label, rateHz, widthCent, isDetected};
+  }
+  function detectDynamicFromFeatures(h15, h3, h5, noiseGap){
+    const brightness = average([h3, h5]) - h15;
+    if(brightness < 6 && noiseGap < 22) return 'pp';
+    if(brightness > 14 || noiseGap > 30) return 'ff';
+    return 'mf';
+  }
+  function detectRangeProfile(f0){
+    if(f0 < 500) return 'low';
+    if(f0 < 1200) return 'mid';
+    return 'high';
+  }
+  function getAdaptiveProfile(f0, h1, h15, h3, h5, noiseGap){
+    const dyn = detectDynamicFromFeatures(h15, h3, h5, noiseGap);
+    const range = detectRangeProfile(f0);
+    let p = {dyn, range, goodPitchCent:10, goodTimbreScore:80, goodSeriesLo:5, goodSeriesHi:15, goodNoiseLo:30, h15Warn:-20, h15Good:-26, h5Over3Warn:2};
+    if(dyn === 'pp'){ p.goodSeriesLo=2; p.goodSeriesHi=10; p.goodNoiseLo=18; p.h15Warn=-18; p.h15Good=-24; }
+    else if(dyn === 'ff'){ p.goodSeriesLo=7; p.goodSeriesHi=18; p.goodNoiseLo=32; p.h15Warn=-15; p.h15Good=-22; }
+    if(range === 'low'){ p.goodSeriesLo -= 1; p.goodSeriesHi -= 1; p.goodNoiseLo -= 2; p.h15Warn -= 2; p.h15Good -= 2; p.h5Over3Warn = 1.5; }
+    else if(range === 'high'){ p.goodSeriesLo -= 2; p.goodSeriesHi += 1; p.goodNoiseLo -= 3; p.h15Warn += 3; p.h15Good += 3; p.h5Over3Warn = 3.5; }
+    return p;
+  }
+  function getStableFrameIndexByTime(frameIdx, stableDelaySec){
+    if(!frames.length) return frameIdx;
+    const tNow=frames[frameIdx].t, tTarget=Math.max(0, tNow - stableDelaySec);
+    let lo=0, hi=frameIdx;
+    while(lo<hi){
+      const mid=Math.floor((lo+hi+1)/2);
+      if(frames[mid].t <= tTarget) lo=mid; else hi=mid-1;
+    }
+    return lo;
+  }
+  function judgeTimbre(frameIdx, maxHarm, bandWidth){
+    const stableDelaySec = parseFloat($('stableDelay').value) || 0.7;
+    const evalIdx = getStableFrameIndexByTime(frameIdx, stableDelaySec);
+    const evalFrame = frames[evalIdx];
+    const h1=getBandEnergy(evalFrame.spec,1.0,bandWidth,maxHarm);
+    const h15=getBandEnergy(evalFrame.spec,1.5,bandWidth,maxHarm);
+    const h2=getBandEnergy(evalFrame.spec,2.0,bandWidth,maxHarm);
+    const h3=getBandEnergy(evalFrame.spec,3.0,bandWidth,maxHarm);
+    const h4=getBandEnergy(evalFrame.spec,4.0,bandWidth,maxHarm);
+    const h5=getBandEnergy(evalFrame.spec,5.0,bandWidth,maxHarm);
+    const n12=getInterHarmonicNoise(evalFrame.spec,1.0,1.5,0.08,maxHarm);
+    const n23=getInterHarmonicNoise(evalFrame.spec,1.5,2.0,0.08,maxHarm);
+    const n34=getInterHarmonicNoise(evalFrame.spec,2.0,3.0,0.10,maxHarm);
+    const noiseFloor=average([n12,n23,n34]), noiseGap=h1-noiseFloor;
+    const profile=getAdaptiveProfile(evalFrame.f0,h1,h15,h3,h5,noiseGap);
+
+    const idx15=Math.round((1.5/maxHarm)*(evalFrame.spec.length-1));
+    const idx3=Math.round((3.0/maxHarm)*(evalFrame.spec.length-1));
+    const idx5=Math.round((5.0/maxHarm)*(evalFrame.spec.length-1));
+    const smooth15=localSmoothness(evalFrame.spec, idx15, 3);
+    const smooth3=localSmoothness(evalFrame.spec, idx3, 4);
+    const smooth5=localSmoothness(evalFrame.spec, idx5, 4);
+    const stability=calcFrameStability(evalIdx,maxHarm,bandWidth);
+
+    const purityScore = clamp(((profile.h15Warn - h15) / Math.max(1,(profile.h15Warn-profile.h15Good))) * 50 + 50, 0, 100);
+    const shapePenalty = Math.max(0, h5 - h3 + profile.h5Over3Warn) * 6
+      + Math.max(0, smooth3 - 4.5) * 6
+      + Math.max(0, smooth5 - 5.0) * 5
+      + Math.max(0, smooth15 - 5.5) * 5;
+    const shapeScore = clamp(100 - shapePenalty, 0, 100);
+    const stabilityPenalty = stability.pitchVar*1.5 + stability.h15Var*3 + stability.h3Var*2 + stability.h5Var*2;
+    const stabilityScore = clamp(100 - stabilityPenalty*2.0, 0, 100);
+    const noiseScore = clamp((noiseGap - profile.goodNoiseLo + 12) * 4.0, 0, 100);
+    const score = clamp(0.35*purityScore + 0.22*stabilityScore + 0.18*shapeScore + 0.25*noiseScore, 0, 100);
+
+    let label='非常に良好';
+    if(score < 85 && score >= 70) label='良好';
+    else if(score < 70 && score >= 55) label='やや要調整';
+    else if(score < 55) label='要調整';
+
+    const reasons=[];
+    if(h15 > profile.h15Warn) reasons.push('1.5倍が強く、上位モードへ引っ張られ気味');
+    else if(h15 > profile.h15Good) reasons.push('1.5倍が少し見えており、もう少しモード純度を上げたい');
+    else reasons.push('1.5倍が十分小さく、モード純度は良好');
+    if(h5 > h3 + profile.h5Over3Warn) reasons.push('5倍音が3倍音より目立ち、やや硬い音色');
+    else if(h3 > -22 && h5 > -28) reasons.push('3倍音・5倍音は適度で、よく響く');
+    else reasons.push('高次倍音は穏やかで、柔らかい音色');
+    if(noiseGap < profile.goodNoiseLo - 8) reasons.push('倍音間の雑音成分がやや多い');
+    else if(noiseGap < profile.goodNoiseLo) reasons.push('息雑音は中程度');
+    else reasons.push('倍音間の雑音は少なく、クリーン');
+    if(stability.pitchVar > 2.0 || stability.h15Var > 2.5) reasons.push('時間変動がやや大きい');
+    else reasons.push('時間変動は小さく、安定している');
+
+    let advice='現状維持で良好';
+    if(h15 > profile.h15Warn) advice='息のスピードを少し抑え、当たりを少し柔らかく';
+    else if(noiseGap < profile.goodNoiseLo - 8) advice='息の出口を少し細くし、息漏れを減らす';
+    else if(h5 > h3 + profile.h5Over3Warn) advice='息の押しを少し減らし、3〜5倍音を整理';
+    else if(stability.pitchVar > 2.0) advice='立ち上がり以降の息圧を一定に';
+    else if(score >= 85) advice='ソノリテとして非常に良好';
+
+    const evenVals=[], oddVals=[];
+    for(let m=2.0; m<=maxHarm+1e-9; m+=2.0) evenVals.push(getBandEnergy(evalFrame.spec,m,bandWidth,maxHarm)-h1);
+    if(1.5<=maxHarm) oddVals.push(getBandEnergy(evalFrame.spec,1.5,bandWidth,maxHarm)-h1);
+    for(let m=3.0; m<=maxHarm+1e-9; m+=2.0) oddVals.push(getBandEnergy(evalFrame.spec,m,bandWidth,maxHarm)-h1);
+    const seriesBalance = average(evenVals) - average(oddVals);
+    return {score,label,reasons,advice,h1,h15,h2,h3,h4,h5,noiseGap,seriesBalance,profile,dyn:profile.dyn,range:profile.range};
+  }
+
+  function drawAxes(ctx, canvas, maxHarm, minDb){
+    const left=60, top=20, right=canvas.width-20, bottom=canvas.height-30;
+    ctx.strokeStyle='#aaa'; ctx.lineWidth=1; ctx.strokeRect(left,top,right-left,bottom-top);
+    ctx.fillStyle='#ddd'; ctx.font='14px sans-serif';
+    for(let h=1; h<=Math.floor(maxHarm); h++){
+      const x=left+(h/maxHarm)*(right-left); ctx.fillText(String(h), x-4, bottom+18);
+    }
+    ctx.fillText('f / f0', right-40, bottom+18);
+    for(let db=0; db>=minDb; db-=20){
+      const y=top+(0-db)/(0-minDb)*(bottom-top);
+      ctx.strokeStyle='rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.moveTo(left,y); ctx.lineTo(right,y); ctx.stroke();
+      ctx.fillStyle='#ddd'; ctx.fillText(`${db}`, 10, y+4);
+    }
+    ctx.fillText('dB', 10, 16);
+  }
+
+  function drawTrail(frameIdx){
+    clearCanvas(trailCtx);
+    const left=60, top=12, right=trailCanvas.width-20, bottom=trailCanvas.height-24;
+    trailCtx.strokeStyle='#aaa'; trailCtx.strokeRect(left,top,right-left,bottom-top);
+    trailCtx.fillStyle='#ddd'; trailCtx.font='13px sans-serif';
+    trailCtx.fillText('直前40フレームの基音推移', 10, 14);
+    const start=Math.max(0, frameIdx-39), subset=frames.slice(start, frameIdx+1);
+    let maxF=0, minF=Infinity;
+    subset.forEach(f => { if(f.f0>maxF) maxF=f.f0; if(f.f0<minF) minF=f.f0; });
+    if(!isFinite(minF) || maxF<=0){ minF=0; maxF=1; }
+    if(maxF===minF){ maxF+=1; minF-=1; }
+    trailCtx.strokeStyle='#ff9f43'; trailCtx.lineWidth=2; trailCtx.beginPath();
+    subset.forEach((f,i)=>{
+      const x=left+i/Math.max(1,subset.length-1)*(right-left);
+      const y=top+(maxF-f.f0)/(maxF-minF)*(bottom-top);
+      if(i===0) trailCtx.moveTo(x,y); else trailCtx.lineTo(x,y);
+    });
+    trailCtx.stroke();
+  }
+
+  function drawZoneBars(pitchCent, timbreScore, seriesBalance, noiseGap, profile=null){
+    clearCanvas(zoneCtx);
+    const left=180, right=zoneCanvas.width-30, barW=right-left, tops=[18,63,108,153], barH=18;
+    const p = profile || {goodPitchCent:10, goodTimbreScore:80, goodSeriesLo:5, goodSeriesHi:15, goodNoiseLo:30};
+    const drawBar=(y,label,value,minV,maxV,goodLo,goodHi,centerTick=null)=>{
+      zoneCtx.fillStyle='#ddd'; zoneCtx.font='14px sans-serif'; zoneCtx.fillText(label, 16, y+14);
+      zoneCtx.fillStyle='rgba(255,255,255,0.08)'; zoneCtx.fillRect(left,y,barW,barH);
+      const gx1=left+(goodLo-minV)/(maxV-minV)*barW, gx2=left+(goodHi-minV)/(maxV-minV)*barW;
+      zoneCtx.fillStyle='rgba(80,200,120,0.35)'; zoneCtx.fillRect(gx1,y,gx2-gx1,barH);
+      zoneCtx.strokeStyle='rgba(220,220,220,0.4)'; zoneCtx.strokeRect(left,y,barW,barH);
+      zoneCtx.fillStyle='#bbb'; zoneCtx.font='12px sans-serif';
+      const tickStep=(label==='Pitch (cent)')?10:((maxV-minV)/5);
+      for(let t=minV; t<=maxV+1e-9; t+=tickStep){
+        const x=left+(t-minV)/(maxV-minV)*barW;
+        zoneCtx.strokeStyle='rgba(255,255,255,0.14)';
+        zoneCtx.beginPath(); zoneCtx.moveTo(x,y); zoneCtx.lineTo(x,y+barH); zoneCtx.stroke();
+        zoneCtx.fillText(t.toFixed(0), x-8, y+barH+16);
+      }
+      if(centerTick!==null && centerTick>=minV && centerTick<=maxV){
+        const cx=left+(centerTick-minV)/(maxV-minV)*barW;
+        zoneCtx.strokeStyle='rgba(255,255,255,0.65)'; zoneCtx.lineWidth=2;
+        zoneCtx.beginPath(); zoneCtx.moveTo(cx,y-8); zoneCtx.lineTo(cx,y+barH+8); zoneCtx.stroke();
+        zoneCtx.fillStyle='#fff'; zoneCtx.font='bold 12px sans-serif'; zoneCtx.fillText('0', cx-4, y-10);
+      }
+      const v=Math.max(minV,Math.min(maxV,value));
+      const vx=left+(v-minV)/(maxV-minV)*barW;
+      zoneCtx.strokeStyle='#ffd166'; zoneCtx.lineWidth=2;
+      zoneCtx.beginPath(); zoneCtx.moveTo(vx,y-6); zoneCtx.lineTo(vx,y+barH+6); zoneCtx.stroke();
+    };
+    drawBar(tops[0], 'Pitch (cent)', pitchCent, -30, 30, -p.goodPitchCent, p.goodPitchCent, 0);
+    drawBar(tops[1], 'Timbre (score)', timbreScore, 0, 100, p.goodTimbreScore, 100);
+    drawBar(tops[2], 'Series balance', seriesBalance, -10, 20, p.goodSeriesLo, p.goodSeriesHi);
+    drawBar(tops[3], 'Noise gap', noiseGap, 0, 50, p.goodNoiseLo, 50);
+  }
+
+  function processFrame(frame, sr){
+    const fftSize = nextPow2(parseInt($('fftSize').value, 10));
+    const maxHarm = parseFloat($('maxHarm').value);
+    const minDb = parseFloat($('minDb').value);
+    const bandWidth = parseFloat($('bandWidth').value);
+    const win = hann(fftSize);
+    const windowed = new Float32Array(fftSize);
+    for(let i=0;i<fftSize;i++) windowed[i] = frame[i] * win[i];
+    const f0 = estimateF0AC(windowed, sr, 200, 1500);
+    if(!f0 || !isFinite(f0)) return;
+
+    const mags = fftRealMag(windowed);
+    const v35Level = v35LikeLevelFromMags(mags);
+    let localMax=1e-12;
+    for(let k=1;k<mags.length;k++) if(mags[k] > localMax) localMax = mags[k];
+    const binsX = 900, binHz = sr / fftSize;
+    const row = new Float32Array(binsX); row.fill(minDb);
+    for(let k=1;k<mags.length;k++){
+      const harm = (k*binHz)/f0;
+      if(harm <= 0 || harm > maxHarm) continue;
+      const xbin = Math.floor((harm/maxHarm) * binsX);
+      if(xbin < 0 || xbin >= binsX) continue;
+      const valDb = dB(mags[k] / localMax);
+      if(valDb > row[xbin]) row[xbin] = valDb;
+    }
+    const smooth = new Float32Array(binsX);
+    for(let i=0;i<binsX;i++){
+      const a=row[Math.max(0,i-1)], b=row[i], c=row[Math.min(binsX-1,i+1)];
+      smooth[i]=(a+2*b+c)/4;
+    }
+
+    const nowT = audioCtx.currentTime;
+    frames.push({t:nowT, f0, spec:smooth});
+    if(frames.length > maxFrames) frames.shift();
+
+    clearCanvas(specCtx);
+    drawAxes(specCtx, specCanvas, maxHarm, minDb);
+    specCtx.strokeStyle='#00ffff'; specCtx.lineWidth=2; specCtx.beginPath();
+    for(let i=0;i<smooth.length;i++){
+      const x=60+i/(smooth.length-1)*(specCanvas.width-80);
+      const y=20+(0-smooth[i])/(0-minDb)*(specCanvas.height-50);
+      if(i===0) specCtx.moveTo(x,y); else specCtx.lineTo(x,y);
+    }
+    specCtx.stroke();
+
+    specCtx.strokeStyle='rgba(255,255,255,0.18)';
+    for(let h=1; h<=Math.floor(maxHarm); h++){
+      const x=60+(h/maxHarm)*(specCanvas.width-80);
+      specCtx.beginPath(); specCtx.moveTo(x,20); specCtx.lineTo(x,specCanvas.height-30); specCtx.stroke();
+    }
+
+    const peakPoint=(multiple,valDb)=>{
+      const x=60+(multiple/maxHarm)*(specCanvas.width-80);
+      const y=20+(0-valDb)/(0-minDb)*(specCanvas.height-50);
+      return {x,y};
+    };
+    const h1 = getBandEnergy(smooth, 1.0, bandWidth, maxHarm);
+    const drawPolyline=(multiples,color,lineWidth,markerRadius)=>{
+      const pts=[];
+      multiples.forEach(m=>{
+        if(m>maxHarm) return;
+        pts.push(peakPoint(m, getBandEnergy(smooth,m,bandWidth,maxHarm)));
+      });
+      if(pts.length < 2) return;
+      specCtx.strokeStyle=color; specCtx.lineWidth=lineWidth; specCtx.beginPath();
+      specCtx.moveTo(pts[0].x, pts[0].y);
+      for(let i=1;i<pts.length;i++) specCtx.lineTo(pts[i].x, pts[i].y);
+      specCtx.stroke();
+      pts.forEach(pt=>{ specCtx.fillStyle=color; specCtx.beginPath(); specCtx.arc(pt.x, pt.y, markerRadius, 0, Math.PI*2); specCtx.fill(); });
+    };
+    const evenMultiples=[1.0]; for(let m=2.0; m<=maxHarm+1e-9; m+=2.0) evenMultiples.push(m);
+    const oddSeries=[1.0]; if(1.5<=maxHarm) oddSeries.push(1.5); for(let m=3.0; m<=maxHarm+1e-9; m+=2.0) oddSeries.push(m);
+    drawPolyline(evenMultiples,'rgba(70,150,255,0.95)',1.4,2.6);
+    drawPolyline(oddSeries,'rgba(255,80,80,0.98)',1.9,3.2);
+
+    const idx = frames.length - 1;
+    const timbre = judgeTimbre(idx, maxHarm, bandWidth);
+    const cents = centsDiff442(f0);
+    const pitchText = judgePitchText(cents);
+    const vibrato = calcVibrato(idx);
+    const vibText = `${vibrato.label} ${vibrato.rateHz.toFixed(1)}Hz ${vibrato.widthCent.toFixed(1)}c`;
+    const fmt = v => (v >= 0 ? '+' : '-') + Math.abs(v).toFixed(1).padStart(5, ' ');
+    const padText = (s, n) => String(s).padEnd(n, ' ');
+    const reason1 = timbre.reasons[0] || '-';
+    const reason2 = timbre.reasons[1] || '-';
+    const reason3 = timbre.reasons[2] || '-';
+    const reason4 = timbre.reasons[3] || '-';
+
+    const line1 =
+      `Pitch: ${fmt(cents)} cent` +
+      ` / Timbre: score ${String(timbre.score.toFixed(0)).padStart(2,' ')}` +
+      ` / Vibrato: ${vibText}` +
+      ` / Dyn/Range: ${timbre.dyn}/${timbre.range}` +
+      ` / Series balance: ${fmt(timbre.seriesBalance)} dB` +
+      ` / Noise gap: ${fmt(timbre.noiseGap)} dB`;
+    const line2 =
+      `Reason: ${padText(reason1, 24)} / ${padText(reason2, 20)} / ${padText(reason3, 18)} / ${reason4}`;
+    const line3 = `Advice: ${timbre.advice}`;
+    judgeBox.textContent = line1 + '\n' + line2 + '\n' + line3;
+
+    drawZoneBars(cents, timbre.score, timbre.seriesBalance, timbre.noiseGap, timbre.profile);
+    drawTrail(idx);
+
+    // relative series display omitted from graph; just status
+    let rms=0; for(let i=0;i<frame.length;i++) rms += frame[i]*frame[i]; rms=Math.sqrt(rms/frame.length);
+    const dbfs = dB(rms);
+    infoEl.textContent = `f0: ${f0.toFixed(2)} Hz / note: ${freqToNoteName442(f0)} / level(v3.5互換): ${v35Level.toFixed(1)} dB / rms: ${dbfs.toFixed(1)} dBFS`;
+  }
+
+  function onAudioProcess(e){
+    if(!running) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const frame = new Float32Array(input.length);
+    frame.set(input);
+
+    // keep a rolling buffer
+    for(let i=0;i<frame.length;i++) ringBuffer.push(frame[i]);
+    const fftSize = nextPow2(parseInt($('fftSize').value, 10));
+    const maxRing = fftSize * 2;
+    if(ringBuffer.length > maxRing) ringBuffer.splice(0, ringBuffer.length - maxRing);
+
+    let rms=0; for(let i=0;i<frame.length;i++) rms += frame[i]*frame[i]; rms=Math.sqrt(rms/frame.length);
+    const dbfs = dB(rms);
+    const threshold = parseFloat($('startThreshold').value);
+    let displayLevel = dbfs;
+    const fftSizeTrig = nextPow2(parseInt($('fftSize').value, 10));
+    if(ringBuffer.length >= fftSizeTrig){
+      const recent = ringBuffer.slice(ringBuffer.length - fftSizeTrig);
+      const winTrig = hann(fftSizeTrig);
+      const windowedTrig = new Float32Array(fftSizeTrig);
+      for(let i=0;i<fftSizeTrig;i++) windowedTrig[i] = recent[i] * winTrig[i];
+      const magsTrig = fftRealMag(windowedTrig);
+      displayLevel = v35LikeLevelFromMags(magsTrig);
+    }
+    if(!isTriggered){
+      infoEl.textContent = `f0: - Hz / note: - / level(v3.5互換): ${displayLevel.toFixed(1)} dB / rms: ${dbfs.toFixed(1)} dBFS`;
+      if(displayLevel >= threshold){
+        isTriggered = true;
+        setStatus('測定中', 'ok');
+      } else {
+        setStatus('待機中（閾値待ち）', 'warn');
+        return;
+      }
+    }
+
+    // throttle UI to ~20 fps
+    const now = performance.now();
+    if(now - lastUpdateMs < 50) return;
+    lastUpdateMs = now;
+
+    if(ringBuffer.length >= fftSize){
+      const recent = ringBuffer.slice(ringBuffer.length - fftSize);
+      processFrame(recent, audioCtx.sampleRate);
+    }
+  }
+
+  async function startMic(){
+    try{
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      const procSize = 2048;
+      processor = audioCtx.createScriptProcessor(procSize, 1, 1);
+      sourceNode.connect(processor);
+      processor.connect(audioCtx.destination);
+      processor.onaudioprocess = onAudioProcess;
+
+      running = true;
+      isTriggered = false;
+      ringBuffer = [];
+      frames = [];
+      lastUpdateMs = 0;
+      setStatus('マイク待機中', 'warn');
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    } catch(err){
+      console.error(err);
+      setStatus('マイク開始エラー: ' + err.message, 'warn');
+    }
+  }
+
+  function stopMic(){
+    running = false;
+    if(processor){ processor.disconnect(); processor.onaudioprocess = null; processor = null; }
+    if(sourceNode){ sourceNode.disconnect(); sourceNode = null; }
+    if(mediaStream){ mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    if(audioCtx){ audioCtx.close(); audioCtx = null; }
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus('停止しました。', '');
+  }
+
+  startBtn.addEventListener('click', startMic);
+  stopBtn.addEventListener('click', stopMic);
+})();
+</script>
+</body>
+</html>
